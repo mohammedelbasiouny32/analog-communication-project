@@ -1,0 +1,412 @@
+%% =========================================================================
+%  Super-heterodyne Receiver Simulation
+%  Cairo University – Faculty of Engineering
+%  Electronics & Communication Department
+%  Analog Modulation Communication Project – 2026
+% =========================================================================
+%
+%  System Chain:
+%    Audio Files --> DSB-SC Modulator --> FDM Signal --> RF BPF --> Mixer
+%    --> IF BPF --> Baseband Detector --> Recovered Audio
+%
+%  Covers all discussion questions:
+%    Q2 : Spectra at RF / IF / Baseband stages
+%    Q3 : Sound playback of demodulated signal
+%    Q4 : Repeat without RF BPF (image interference)
+%    Q5 : Oscillator frequency offsets of 0.1 kHz and 1 kHz
+% =========================================================================
+
+clear; close all; clc;
+
+% -------------------------------------------------------------------------
+%  SYSTEM PARAMETERS
+% -------------------------------------------------------------------------
+FIRST_CARRIER_FREQ  = 100e3;   % F0  – carrier of station 0        (Hz)
+CARRIER_SPACING     = 30e3;    % ΔF  – spacing between stations    (Hz)
+IF_FREQ             = 15e3;    % FIF – intermediate frequency       (Hz)
+UPSAMPLE_FACTOR     = 10;      % Factor to raise Fs and avoid aliasing
+FILTER_ORDER        = 6;       % Butterworth filter order
+STATION_TO_RECEIVE  = 0;       % 0-indexed station index to demodulate
+
+% -------------------------------------------------------------------------
+%  SECTION 1 – LOAD AUDIO SIGNALS
+%  Place your .wav files in the same folder as this script.
+%  If a file is not found, a synthetic test tone is used automatically.
+% -------------------------------------------------------------------------
+fprintf('=== SECTION 1: Loading Audio Signals ===\n');
+
+audio_file_list = {'signal1.wav', 'signal2.wav'};   % Add more files here
+num_stations    = numel(audio_file_list);
+
+raw_mono_signals = cell(num_stations, 1);
+original_sample_rates = zeros(num_stations, 1);
+
+for station_idx = 1 : num_stations
+    filename = audio_file_list{station_idx};
+
+    if isfile(filename)
+        [audio_data, sample_rate] = audioread(filename);
+        fprintf('  Loaded "%s"  |  Fs = %d Hz  |  Size = [%d x %d]\n', ...
+                filename, sample_rate, size(audio_data, 1), size(audio_data, 2));
+
+        % Convert stereo to mono by summing the two channels
+        if size(audio_data, 2) == 2
+            mono_signal = audio_data(:, 1) + audio_data(:, 2);
+        else
+            mono_signal = audio_data(:, 1);
+        end
+    else
+        % ---- Fallback: synthesise a test signal ----
+        fprintf('  "%s" not found – using synthetic test signal.\n', filename);
+        sample_rate = 8000;                              % 8 kHz
+        duration    = 2;                                 % seconds
+        time_vector = (0 : 1/sample_rate : duration - 1/sample_rate)';
+        tone_freq_1 = 800  + (station_idx - 1) * 400;   % Different tone per station
+        tone_freq_2 = 2000 + (station_idx - 1) * 400;
+        mono_signal = 0.6 * sin(2*pi * tone_freq_1 * time_vector) + ...
+                      0.4 * sin(2*pi * tone_freq_2 * time_vector);
+    end
+
+    % Normalise amplitude to [-1, 1]
+    mono_signal = mono_signal / (max(abs(mono_signal)) + eps);
+    raw_mono_signals{station_idx}    = mono_signal;
+    original_sample_rates(station_idx) = sample_rate;
+end
+
+% Use the first file's sample rate as the common base sample rate
+base_sample_rate = original_sample_rates(1);
+
+% Pad shorter signals with zeros so all signals have equal length
+max_signal_length = max(cellfun(@numel, raw_mono_signals));
+for station_idx = 1 : num_stations
+    current_length = numel(raw_mono_signals{station_idx});
+    if current_length < max_signal_length
+        pad_length = max_signal_length - current_length;
+        raw_mono_signals{station_idx} = ...
+            [raw_mono_signals{station_idx}; zeros(pad_length, 1)];
+        fprintf('  Station %d: padded with %d zeros.\n', station_idx, pad_length);
+    end
+end
+
+fprintf('  Common signal length = %d samples  |  Base Fs = %d Hz\n', ...
+        max_signal_length, base_sample_rate);
+
+% -------------------------------------------------------------------------
+%  SECTION 2 – UPSAMPLE SIGNALS
+%  The carrier frequencies (100+ kHz) are much higher than the audio Fs.
+%  We upsample by UPSAMPLE_FACTOR to raise Fs above 2 × max_carrier_freq.
+% -------------------------------------------------------------------------
+fprintf('\n=== SECTION 2: Upsampling Signals (×%d) ===\n', UPSAMPLE_FACTOR);
+
+effective_sample_rate = base_sample_rate * UPSAMPLE_FACTOR;   % Fs after upsampling
+sampling_interval     = 1 / effective_sample_rate;            % Ts
+
+upsampled_signals = cell(num_stations, 1);
+for station_idx = 1 : num_stations
+    upsampled_signals{station_idx} = ...
+        interp(raw_mono_signals{station_idx}, UPSAMPLE_FACTOR);
+end
+
+total_samples = numel(upsampled_signals{1});
+time_vector   = (0 : total_samples - 1)' * sampling_interval;   % t (seconds)
+
+fprintf('  Effective Fs = %.1f kHz  |  Total samples per signal = %d\n', ...
+        effective_sample_rate / 1e3, total_samples);
+
+% --- Plot baseband signal spectra ---
+figure('Name', 'Figure 1 – Baseband Signal Spectra', ...
+       'NumberTitle', 'off', 'Color', 'w');
+for station_idx = 1 : num_stations
+    subplot(num_stations, 1, station_idx);
+    plot_spectrum(upsampled_signals{station_idx}, effective_sample_rate, ...
+        sprintf('Baseband Signal %d Spectrum', station_idx), ...
+        'blue');
+end
+sgtitle('Baseband Audio Signal Spectra', 'FontSize', 13, 'FontWeight', 'bold');
+
+% Estimate message bandwidth (used to design filters)
+message_bandwidth = estimate_bandwidth_99pct( ...
+    upsampled_signals{STATION_TO_RECEIVE + 1}, effective_sample_rate);
+fprintf('  Estimated message bandwidth (99%% power) = %.2f kHz\n', ...
+        message_bandwidth / 1e3);
+
+% -------------------------------------------------------------------------
+%  SECTION 3 – DSB-SC MODULATION & FDM MULTIPLEXING
+%  Each station modulates with DSB-SC at Fn = F0 + n × ΔF.
+%  All modulated signals are summed to form the FDM composite.
+% -------------------------------------------------------------------------
+fprintf('\n=== SECTION 3: DSB-SC Modulation & FDM Multiplexing ===\n');
+
+carrier_freq_list  = zeros(num_stations, 1);
+modulated_matrix   = zeros(total_samples, num_stations);
+
+for station_idx = 1 : num_stations
+    n_index    = station_idx - 1;                                   % 0-indexed
+    carrier_fn = FIRST_CARRIER_FREQ + n_index * CARRIER_SPACING;    % Fn
+    carrier_freq_list(station_idx) = carrier_fn;
+
+    % DSB-SC: multiply message by cosine carrier
+    carrier_signal = cos(2 * pi * carrier_fn * time_vector);
+    modulated_matrix(:, station_idx) = ...
+        upsampled_signals{station_idx} .* carrier_signal;
+
+    fprintf('  Station %d (n=%d): Carrier = %.1f kHz\n', ...
+            station_idx, n_index, carrier_fn / 1e3);
+end
+
+% FDM signal = sum of all modulated stations
+fdm_signal = sum(modulated_matrix, 2);
+
+% --- Plot FDM spectrum ---
+figure('Name', 'Figure 2 – FDM Signal Spectrum', ...
+       'NumberTitle', 'off', 'Color', 'w');
+plot_spectrum(fdm_signal, effective_sample_rate, ...
+    'FDM Signal Spectrum (All Stations Multiplexed)', 'red');
+sgtitle('FDM Composite Signal', 'FontSize', 13, 'FontWeight', 'bold');
+
+% =========================================================================
+%  RECEIVER CHAIN – WITH RF BPF  (Questions 2 & 3)
+% =========================================================================
+fprintf('\n=== RECEIVER: Station %d  |  Fc = %.1f kHz ===\n', ...
+        STATION_TO_RECEIVE, carrier_freq_list(STATION_TO_RECEIVE + 1) / 1e3);
+
+target_carrier_freq = carrier_freq_list(STATION_TO_RECEIVE + 1);
+oscillator_freq     = target_carrier_freq + IF_FREQ;   % ωc + ωIF
+rf_bandwidth        = 2 * message_bandwidth;           % DSB-SC bandwidth
+
+% --- RF Stage: BPF centred at the target carrier ---
+fprintf('\n--- RF Stage (BPF @ %.1f kHz, BW = %.2f kHz) ---\n', ...
+        target_carrier_freq / 1e3, rf_bandwidth / 1e3);
+rf_output = apply_bandpass_filter(fdm_signal, target_carrier_freq, ...
+            rf_bandwidth, effective_sample_rate, FILTER_ORDER);
+
+% --- Mixer: multiply RF output by local oscillator ---
+local_oscillator = cos(2 * pi * oscillator_freq * time_vector);
+mixer_output     = rf_output .* local_oscillator;
+
+% --- IF Stage: BPF centred at IF frequency ---
+fprintf('--- IF Stage  (BPF @ %.1f kHz, BW = %.2f kHz) ---\n', ...
+        IF_FREQ / 1e3, rf_bandwidth / 1e3);
+if_output = apply_bandpass_filter(mixer_output, IF_FREQ, ...
+            rf_bandwidth, effective_sample_rate, FILTER_ORDER);
+
+% --- Baseband Detection: mix with IF carrier then LPF ---
+fprintf('--- Baseband Detection (LPF cutoff = %.2f kHz) ---\n', ...
+        message_bandwidth / 1e3);
+if_carrier   = cos(2 * pi * IF_FREQ * time_vector);
+bb_mixed     = if_output .* if_carrier;
+bb_output    = apply_lowpass_filter(bb_mixed, message_bandwidth, ...
+               effective_sample_rate, FILTER_ORDER);
+bb_output    = bb_output / (max(abs(bb_output)) + eps);   % Normalise
+
+% -------------------------------------------------------------------------
+%  QUESTION 2 – Plot spectra at RF, IF, and Baseband stages
+% -------------------------------------------------------------------------
+figure('Name', 'Figure 3 – Receiver Stage Spectra (WITH RF BPF)', ...
+       'NumberTitle', 'off', 'Color', 'w');
+
+subplot(3, 1, 1);
+plot_spectrum(rf_output, effective_sample_rate, ...
+    sprintf('(1) RF Stage Output  –  Centred at %.1f kHz', ...
+    target_carrier_freq / 1e3), 'green');
+
+subplot(3, 1, 2);
+plot_spectrum(if_output, effective_sample_rate, ...
+    sprintf('(2) IF Stage Output  –  Centred at %.1f kHz', IF_FREQ / 1e3), ...
+    'magenta');
+
+subplot(3, 1, 3);
+plot_spectrum(bb_output, effective_sample_rate, ...
+    '(3) Baseband Output  –  Recovered Message', 'blue');
+
+sgtitle(sprintf('Receiver Stages – Station %d (WITH RF BPF)', STATION_TO_RECEIVE), ...
+        'FontSize', 13, 'FontWeight', 'bold');
+
+% -------------------------------------------------------------------------
+%  QUESTION 3 – Play demodulated audio
+% -------------------------------------------------------------------------
+fprintf('\n=== Q3: Playing demodulated audio (WITH RF BPF) ===\n');
+audio_playback = decimate(bb_output, UPSAMPLE_FACTOR, 'fir');
+audio_playback = audio_playback / (max(abs(audio_playback)) + eps);
+fprintf('  Playing at Fs = %d Hz  |  Duration ≈ %.1f s\n', ...
+        base_sample_rate, numel(audio_playback) / base_sample_rate);
+sound(audio_playback, base_sample_rate);
+pause(numel(audio_playback) / base_sample_rate + 0.5);
+
+% =========================================================================
+%  QUESTION 4 – REPEAT WITHOUT RF BPF
+% =========================================================================
+fprintf('\n=== Q4: Receiver WITHOUT RF Stage BPF ===\n');
+
+% Mixer directly receives the full FDM signal (no RF pre-filtering)
+mixer_output_noRF = fdm_signal .* local_oscillator;
+if_output_noRF    = apply_bandpass_filter(mixer_output_noRF, IF_FREQ, ...
+                    rf_bandwidth, effective_sample_rate, FILTER_ORDER);
+bb_mixed_noRF     = if_output_noRF .* if_carrier;
+bb_output_noRF    = apply_lowpass_filter(bb_mixed_noRF, message_bandwidth, ...
+                    effective_sample_rate, FILTER_ORDER);
+bb_output_noRF    = bb_output_noRF / (max(abs(bb_output_noRF)) + eps);
+
+figure('Name', 'Figure 4 – Receiver Stage Spectra (WITHOUT RF BPF)', ...
+       'NumberTitle', 'off', 'Color', 'w');
+
+subplot(3, 1, 1);
+plot_spectrum(fdm_signal, effective_sample_rate, ...
+    '(1) FDM Signal – Enters Mixer Directly (No RF Filter)', 'red');
+
+subplot(3, 1, 2);
+plot_spectrum(if_output_noRF, effective_sample_rate, ...
+    sprintf('(2) IF Stage Output – Centred at %.1f kHz (No RF BPF)', IF_FREQ / 1e3), ...
+    'magenta');
+
+subplot(3, 1, 3);
+plot_spectrum(bb_output_noRF, effective_sample_rate, ...
+    '(3) Baseband Output – Contains Image Interference', 'blue');
+
+sgtitle(sprintf('Receiver Stages – Station %d (WITHOUT RF BPF)', STATION_TO_RECEIVE), ...
+        'FontSize', 13, 'FontWeight', 'bold');
+
+fprintf('  Playing audio WITHOUT RF BPF (expect interference / distortion)...\n');
+audio_noRF = decimate(bb_output_noRF, UPSAMPLE_FACTOR, 'fir');
+audio_noRF = audio_noRF / (max(abs(audio_noRF)) + eps);
+sound(audio_noRF, base_sample_rate);
+pause(numel(audio_noRF) / base_sample_rate + 0.5);
+
+% =========================================================================
+%  QUESTION 5 – OSCILLATOR FREQUENCY OFFSETS
+% =========================================================================
+fprintf('\n=== Q5: Oscillator Frequency Offset Analysis ===\n');
+
+offset_values_hz = [0.1e3, 1e3];           % 0.1 kHz and 1 kHz
+offset_labels    = {'0.1 kHz Offset', '1 kHz Offset'};
+
+figure('Name', 'Figure 5 – Oscillator Frequency Offset Effect', ...
+       'NumberTitle', 'off', 'Color', 'w');
+
+for offset_idx = 1 : numel(offset_values_hz)
+    freq_offset = offset_values_hz(offset_idx);
+    osc_freq_offset = oscillator_freq + freq_offset;   % Shifted oscillator
+
+    fprintf('  Offset = %.1f kHz  |  Oscillator = %.2f kHz\n', ...
+            freq_offset / 1e3, osc_freq_offset / 1e3);
+
+    % Full receiver chain with offset oscillator
+    osc_offset    = cos(2 * pi * osc_freq_offset * time_vector);
+    rf_out_off    = apply_bandpass_filter(fdm_signal, target_carrier_freq, ...
+                    rf_bandwidth, effective_sample_rate, FILTER_ORDER);
+    mix_off       = rf_out_off .* osc_offset;
+    if_out_off    = apply_bandpass_filter(mix_off, IF_FREQ, ...
+                    rf_bandwidth, effective_sample_rate, FILTER_ORDER);
+    bb_mix_off    = if_out_off .* if_carrier;
+    bb_out_off    = apply_lowpass_filter(bb_mix_off, message_bandwidth, ...
+                    effective_sample_rate, FILTER_ORDER);
+    bb_out_off    = bb_out_off / (max(abs(bb_out_off)) + eps);
+
+    subplot(numel(offset_values_hz), 1, offset_idx);
+    plot_spectrum(bb_out_off, effective_sample_rate, ...
+        sprintf('Baseband Spectrum with Oscillator %s (Δf = %.1f kHz)', ...
+        offset_labels{offset_idx}, freq_offset / 1e3), 'blue');
+
+    % Playback with offset
+    fprintf('  Playing audio with %s...\n', offset_labels{offset_idx});
+    audio_off = decimate(bb_out_off, UPSAMPLE_FACTOR, 'fir');
+    audio_off = audio_off / (max(abs(audio_off)) + eps);
+    sound(audio_off, base_sample_rate);
+    pause(numel(audio_off) / base_sample_rate + 0.5);
+end
+
+sgtitle('Effect of Oscillator Frequency Offset on Demodulated Signal', ...
+        'FontSize', 13, 'FontWeight', 'bold');
+
+fprintf('\n=== Simulation Complete ===\n');
+
+% =========================================================================
+%  LOCAL HELPER FUNCTIONS
+% =========================================================================
+
+function plot_spectrum(signal, sample_rate, title_string, line_color)
+% PLOT_SPECTRUM  Plot the double-sided amplitude spectrum of a signal.
+%
+%   signal        – column vector of signal samples
+%   sample_rate   – sampling frequency Fs (Hz)
+%   title_string  – title for the subplot
+%   line_color    – MATLAB color string (e.g., 'blue', 'red')
+
+    num_samples   = numel(signal);
+    freq_axis     = (-num_samples/2 : num_samples/2 - 1) * ...
+                    (sample_rate / num_samples);          % Centred frequency axis
+    spectrum      = fftshift(fft(signal));                % Centred FFT
+    amplitude     = abs(spectrum) / num_samples;          % Normalised magnitude
+
+    plot(freq_axis / 1e3, amplitude, 'Color', line_color, 'LineWidth', 1.2);
+    title(title_string, 'FontSize', 10, 'FontWeight', 'bold');
+    xlabel('Frequency (kHz)', 'FontSize', 9);
+    ylabel('|X(f)| – Normalised', 'FontSize', 9);
+    xlim([-sample_rate/2/1e3, sample_rate/2/1e3]);
+    grid on;
+end
+
+% -------------------------------------------------------------------------
+
+function filtered_signal = apply_bandpass_filter( ...
+    input_signal, center_freq, bandwidth, sample_rate, filter_order)
+% APPLY_BANDPASS_FILTER  Design and apply a zero-phase Butterworth BPF.
+%
+%   input_signal  – signal to filter
+%   center_freq   – centre frequency of the BPF (Hz)
+%   bandwidth     – 3 dB bandwidth of the BPF (Hz)
+%   sample_rate   – sampling frequency Fs (Hz)
+%   filter_order  – Butterworth filter order
+
+    nyquist_freq = sample_rate / 2;
+    low_edge     = (center_freq - bandwidth / 2) / nyquist_freq;
+    high_edge    = (center_freq + bandwidth / 2) / nyquist_freq;
+
+    % Clamp to valid range (0, 1) exclusive
+    low_edge  = max(low_edge,  1e-4);
+    high_edge = min(high_edge, 1 - 1e-4);
+
+    [b_coeff, a_coeff] = butter(filter_order, [low_edge, high_edge], 'bandpass');
+    filtered_signal    = filtfilt(b_coeff, a_coeff, input_signal);
+end
+
+% -------------------------------------------------------------------------
+
+function filtered_signal = apply_lowpass_filter( ...
+    input_signal, cutoff_freq, sample_rate, filter_order)
+% APPLY_LOWPASS_FILTER  Design and apply a zero-phase Butterworth LPF.
+%
+%   input_signal  – signal to filter
+%   cutoff_freq   – 3 dB cutoff frequency (Hz)
+%   sample_rate   – sampling frequency Fs (Hz)
+%   filter_order  – Butterworth filter order
+
+    nyquist_freq     = sample_rate / 2;
+    normalised_cutoff = min(cutoff_freq / nyquist_freq, 1 - 1e-4);
+
+    [b_coeff, a_coeff] = butter(filter_order, normalised_cutoff, 'low');
+    filtered_signal    = filtfilt(b_coeff, a_coeff, input_signal);
+end
+
+% -------------------------------------------------------------------------
+
+function bandwidth = estimate_bandwidth_99pct(signal, sample_rate)
+% ESTIMATE_BANDWIDTH_99PCT  Estimate signal bandwidth containing 99% of power.
+%
+%   signal      – baseband signal vector
+%   sample_rate – sampling frequency Fs (Hz)
+%   bandwidth   – estimated one-sided bandwidth (Hz)
+
+    num_samples    = numel(signal);
+    power_spectrum = abs(fft(signal)).^2;                   % Two-sided power
+    one_sided_pwr  = power_spectrum(1 : floor(num_samples/2)); % Single-sided
+
+    total_power    = sum(one_sided_pwr);
+    cumulative_pwr = cumsum(one_sided_pwr);
+
+    % Index of bin where cumulative power reaches 99%
+    threshold_idx  = find(cumulative_pwr >= 0.99 * total_power, 1, 'first');
+
+    freq_resolution = sample_rate / num_samples;
+    bandwidth       = threshold_idx * freq_resolution * 1.15;  % 15% safety margin
+end
