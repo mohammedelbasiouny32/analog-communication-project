@@ -1,0 +1,422 @@
+
+%  Analog Modulation Communication Project – 2026
+% =========================================================================
+
+clear; close all; clc;
+
+% -------------------------------------------------------------------------
+%  SYSTEM PARAMETERS
+% -------------------------------------------------------------------------
+FIRST_CARRIER_FREQ  = 100e3;
+CARRIER_SPACING     = 30e3;
+IF_FREQ             = 15e3;
+UPSAMPLE_FACTOR     = 10;
+FILTER_ORDER        = 6;
+PLOT_DURATION_MS    = 5;
+
+% -------------------------------------------------------------------------
+%  SECTION 1 – LOAD AUDIO SIGNALS
+% -------------------------------------------------------------------------
+fprintf('=== SECTION 1: Loading Audio Signals ===\n');
+
+audio_file_list = {'signal1.wav', 'signal2.wav'};
+num_stations    = numel(audio_file_list);
+
+raw_mono_signals      = cell(num_stations, 1);
+original_sample_rates = zeros(num_stations, 1);
+
+for station_idx = 1 : num_stations
+    filename = audio_file_list{station_idx};
+    if isfile(filename)
+        [audio_data, sample_rate] = audioread(filename);
+        fprintf('  Loaded "%s"  |  Fs = %d Hz\n', filename, sample_rate);
+        if size(audio_data, 2) == 2
+            mono_signal = audio_data(:,1) + audio_data(:,2);
+        else
+            mono_signal = audio_data(:,1);
+        end
+    else
+        fprintf('  "%s" not found – using synthetic test signal.\n', filename);
+        sample_rate = 8000;
+        duration    = 2;
+        tv          = (0 : 1/sample_rate : duration - 1/sample_rate)';
+        f1 = 400  + (station_idx-1)*1800;
+        f2 = 1200 + (station_idx-1)*1800;
+        mono_signal = 0.6*sin(2*pi*f1*tv) + 0.4*sin(2*pi*f2*tv);
+    end
+    mono_signal = mono_signal / (max(abs(mono_signal)) + eps);
+    raw_mono_signals{station_idx}      = mono_signal;
+    original_sample_rates(station_idx) = sample_rate;
+end
+
+base_sample_rate  = original_sample_rates(1);
+max_signal_length = max(cellfun(@numel, raw_mono_signals));
+
+for station_idx = 1 : num_stations
+    len = numel(raw_mono_signals{station_idx});
+    if len < max_signal_length
+        raw_mono_signals{station_idx} = ...
+            [raw_mono_signals{station_idx}; zeros(max_signal_length - len, 1)];
+    end
+end
+
+% -------------------------------------------------------------------------
+%  SECTION 2 – UPSAMPLE
+% -------------------------------------------------------------------------
+fprintf('\n=== SECTION 2: Upsampling (x%d) ===\n', UPSAMPLE_FACTOR);
+
+Fs = base_sample_rate * UPSAMPLE_FACTOR;
+Ts = 1 / Fs;
+
+upsampled_signals = cell(num_stations, 1);
+for station_idx = 1 : num_stations
+    upsampled_signals{station_idx} = interp(raw_mono_signals{station_idx}, UPSAMPLE_FACTOR);
+end
+
+N = numel(upsampled_signals{1});
+t = (0 : N-1)' * Ts;
+
+% -------------------------------------------------------------------------
+%  BANDWIDTH CALCULATION – ALL STATIONS
+% -------------------------------------------------------------------------
+fprintf('\n=== BANDWIDTH ANALYSIS: All Stations ===\n');
+fprintf('  %-10s %-20s %-20s %-20s\n', 'Station', 'Msg BW (kHz)', 'RF BW (kHz)', 'Carrier (kHz)');
+fprintf('  %s\n', repmat('-', 1, 72));
+
+message_bandwidths = zeros(num_stations, 1);
+rf_bandwidths      = zeros(num_stations, 1);
+carrier_freq_list  = zeros(num_stations, 1);
+
+for station_idx = 1 : num_stations
+    msg_bw = estimate_bandwidth_99pct(upsampled_signals{station_idx}, Fs);
+    rf_bw  = 2 * msg_bw;
+    Fc_n   = FIRST_CARRIER_FREQ + (station_idx - 1) * CARRIER_SPACING;
+    message_bandwidths(station_idx) = msg_bw;
+    rf_bandwidths(station_idx)      = rf_bw;
+    carrier_freq_list(station_idx)  = Fc_n;
+    fprintf('  %-10d %-20.3f %-20.3f %-20.1f\n', ...
+        station_idx, msg_bw/1e3, rf_bw/1e3, Fc_n/1e3);
+end
+
+% Use Station 1 bandwidth as the common reference for shared filters
+message_bandwidth = message_bandwidths(1);
+rf_bandwidth      = rf_bandwidths(1);
+fprintf('\n  Reference message BW (Station 1) = %.3f kHz\n', message_bandwidth/1e3);
+fprintf('  Reference RF BW      (Station 1) = %.3f kHz\n', rf_bandwidth/1e3);
+fprintf('  Effective Fs                      = %.1f kHz\n', Fs/1e3);
+
+% -------------------------------------------------------------------------
+%  SECTION 3 – DSB-SC MODULATION & FDM
+% -------------------------------------------------------------------------
+fprintf('\n=== SECTION 3: Modulation & FDM ===\n');
+
+modulated_matrix = zeros(N, num_stations);
+for station_idx = 1 : num_stations
+    carrier_sig = cos(2*pi*carrier_freq_list(station_idx)*t);
+    modulated_matrix(:, station_idx) = upsampled_signals{station_idx} .* carrier_sig;
+    fprintf('  Station %d: Carrier = %.1f kHz  |  Msg BW = %.3f kHz  |  RF BW = %.3f kHz\n', ...
+        station_idx, carrier_freq_list(station_idx)/1e3, ...
+        message_bandwidths(station_idx)/1e3, rf_bandwidths(station_idx)/1e3);
+end
+
+fdm_signal = sum(modulated_matrix, 2);
+
+if_carrier = cos(2*pi*IF_FREQ*t);
+
+% =========================================================================
+%  FIGURE 1 – BASEBAND SIGNAL SPECTRA (all stations)
+% =========================================================================
+figure('Name','Fig 1 – Baseband Spectra','NumberTitle','off','Color','w');
+for s = 1:num_stations
+    subplot(num_stations,1,s);
+    plot_spectrum(upsampled_signals{s}, Fs, ...
+        sprintf('Station %d Baseband Spectrum  |  Msg BW = %.3f kHz', ...
+                s, message_bandwidths(s)/1e3), 'blue');
+end
+sgtitle('Baseband Audio Signal Spectra – All Stations', ...
+        'FontSize',13,'FontWeight','bold');
+
+% =========================================================================
+%  FIGURE 2 – TRANSMITTED FDM SIGNAL
+% =========================================================================
+figure('Name','Fig 2 – Transmitted FDM Signal','NumberTitle','off','Color','w');
+subplot(2,1,1);
+plot_time(fdm_signal, t, PLOT_DURATION_MS, ...
+    'Transmitted FDM Signal – Time Domain', [0.8 0.2 0]);
+subplot(2,1,2);
+plot_spectrum(fdm_signal, Fs, ...
+    'Transmitted FDM Signal – Spectrum (All Stations)', [0.8 0.2 0]);
+sgtitle('Transmitted FDM Signal','FontSize',13,'FontWeight','bold');
+
+% =========================================================================
+%  CASE A – NORMAL RECEPTION (WITH RF BPF) – BOTH STATIONS
+% =========================================================================
+fprintf('\n=== CASE A: Normal Reception (WITH RF BPF) – Both Stations ===\n');
+
+bb_outs_A = cell(num_stations, 1);
+
+for station_idx = 1 : num_stations
+    target_Fc   = carrier_freq_list(station_idx);
+    F_osc       = target_Fc + IF_FREQ;
+    local_osc_s = cos(2*pi*F_osc*t);
+
+    fprintf('\n  --- Station %d | Carrier = %.1f kHz | LO = %.1f kHz ---\n', ...
+            station_idx, target_Fc/1e3, F_osc/1e3);
+
+    rf_out_A  = apply_BPF(fdm_signal, target_Fc, rf_bandwidth, Fs, FILTER_ORDER);
+    mix_out_A = rf_out_A .* local_osc_s;
+    if_out_A  = apply_BPF(mix_out_A, IF_FREQ, rf_bandwidth, Fs, FILTER_ORDER);
+    bb_mix_A  = if_out_A .* if_carrier;
+    bb_out_A  = apply_LPF(bb_mix_A, message_bandwidth, Fs, FILTER_ORDER);
+    bb_out_A  = bb_out_A / (max(abs(bb_out_A)) + eps);
+    bb_outs_A{station_idx} = bb_out_A;
+
+    % Time domain figure
+    figure('Name', sprintf('Fig A%d-T – Case A Station %d: Time Domain', station_idx, station_idx), ...
+           'NumberTitle','off','Color','w');
+    subplot(5,1,1); plot_time(fdm_signal, t, PLOT_DURATION_MS, ...
+        'Stage 0 – Transmitted FDM Signal', [0.8 0.2 0]);
+    subplot(5,1,2); plot_time(rf_out_A, t, PLOT_DURATION_MS, ...
+        sprintf('Stage 1 – RF BPF (centred %.1f kHz)', target_Fc/1e3), [0 0.6 0]);
+    subplot(5,1,3); plot_time(mix_out_A, t, PLOT_DURATION_MS, ...
+        'Stage 2 – After Mixer', [0.6 0 0.6]);
+    subplot(5,1,4); plot_time(if_out_A, t, PLOT_DURATION_MS, ...
+        sprintf('Stage 3 – IF BPF (centred %.1f kHz)', IF_FREQ/1e3), [0.9 0.5 0]);
+    subplot(5,1,5); plot_time(bb_out_A, t, PLOT_DURATION_MS, ...
+        'Stage 4 – Recovered Signal (Baseband LPF)', [0 0.3 0.9]);
+    sgtitle(sprintf('CASE A – WITH RF BPF | Station %d (%.1f kHz): Time Domain', ...
+                    station_idx, target_Fc/1e3), 'FontSize',13,'FontWeight','bold');
+
+    % Spectrum figure
+    figure('Name', sprintf('Fig A%d-S – Case A Station %d: Spectrum', station_idx, station_idx), ...
+           'NumberTitle','off','Color','w');
+    subplot(5,1,1); plot_spectrum(fdm_signal, Fs, 'Stage 0 – FDM Spectrum', [0.8 0.2 0]);
+    subplot(5,1,2); plot_spectrum(rf_out_A, Fs, ...
+        sprintf('Stage 1 – RF BPF Output (centred %.1f kHz)', target_Fc/1e3), [0 0.6 0]);
+    subplot(5,1,3); plot_spectrum(mix_out_A, Fs, 'Stage 2 – Mixer Output', [0.6 0 0.6]);
+    subplot(5,1,4); plot_spectrum(if_out_A, Fs, ...
+        sprintf('Stage 3 – IF BPF Output (centred %.1f kHz)', IF_FREQ/1e3), [0.9 0.5 0]);
+    subplot(5,1,5); plot_spectrum(bb_out_A, Fs, 'Stage 4 – Recovered Message', [0 0.3 0.9]);
+    sgtitle(sprintf('CASE A – WITH RF BPF | Station %d (%.1f kHz): Spectrum', ...
+                    station_idx, target_Fc/1e3), 'FontSize',13,'FontWeight','bold');
+
+    fprintf('  Playing audio – Case A, Station %d (WITH RF BPF)...\n', station_idx);
+    audio_out = decimate(bb_out_A, UPSAMPLE_FACTOR, 'fir');
+    audio_out = audio_out / (max(abs(audio_out)) + eps);
+    sound(audio_out, base_sample_rate);
+    pause(numel(audio_out)/base_sample_rate + 0.5);
+end
+
+% =========================================================================
+%  CASE B – WITHOUT RF BPF – BOTH STATIONS
+% =========================================================================
+fprintf('\n=== CASE B: Without RF BPF – Both Stations ===\n');
+
+bb_outs_B = cell(num_stations, 1);
+
+for station_idx = 1 : num_stations
+    target_Fc   = carrier_freq_list(station_idx);
+    F_osc       = target_Fc + IF_FREQ;
+    local_osc_s = cos(2*pi*F_osc*t);
+
+    fprintf('\n  --- Station %d | Carrier = %.1f kHz | LO = %.1f kHz ---\n', ...
+            station_idx, target_Fc/1e3, F_osc/1e3);
+
+    mix_out_B = fdm_signal .* local_osc_s;
+    if_out_B  = apply_BPF(mix_out_B, IF_FREQ, rf_bandwidth, Fs, FILTER_ORDER);
+    bb_mix_B  = if_out_B .* if_carrier;
+    bb_out_B  = apply_LPF(bb_mix_B, message_bandwidth, Fs, FILTER_ORDER);
+    bb_out_B  = bb_out_B / (max(abs(bb_out_B)) + eps);
+    bb_outs_B{station_idx} = bb_out_B;
+
+    % Time domain figure
+    figure('Name', sprintf('Fig B%d-T – Case B Station %d: Time Domain', station_idx, station_idx), ...
+           'NumberTitle','off','Color','w');
+    subplot(4,1,1); plot_time(fdm_signal, t, PLOT_DURATION_MS, ...
+        'Stage 0 – FDM Signal (NO RF filter)', [0.8 0.2 0]);
+    subplot(4,1,2); plot_time(mix_out_B, t, PLOT_DURATION_MS, ...
+        'Stage 1 – After Mixer (image NOT rejected)', [0.6 0 0.6]);
+    subplot(4,1,3); plot_time(if_out_B, t, PLOT_DURATION_MS, ...
+        'Stage 2 – IF BPF (desired + image both present)', [0.9 0.5 0]);
+    subplot(4,1,4); plot_time(bb_out_B, t, PLOT_DURATION_MS, ...
+        'Stage 3 – Baseband LPF – DISTORTED (image interference)', [0.9 0 0]);
+    sgtitle(sprintf('CASE B – WITHOUT RF BPF | Station %d (%.1f kHz): Time Domain', ...
+                    station_idx, target_Fc/1e3), 'FontSize',13,'FontWeight','bold');
+
+    % Spectrum figure
+    figure('Name', sprintf('Fig B%d-S – Case B Station %d: Spectrum', station_idx, station_idx), ...
+           'NumberTitle','off','Color','w');
+    subplot(4,1,1); plot_spectrum(fdm_signal, Fs, 'Stage 0 – FDM (no pre-filtering)', [0.8 0.2 0]);
+    subplot(4,1,2); plot_spectrum(mix_out_B, Fs, 'Stage 1 – Mixer Output (image present)', [0.6 0 0.6]);
+    subplot(4,1,3); plot_spectrum(if_out_B, Fs, ...
+        sprintf('Stage 2 – IF BPF (image leaks in, IF = %.1f kHz)', IF_FREQ/1e3), [0.9 0.5 0]);
+    subplot(4,1,4); plot_spectrum(bb_out_B, Fs, ...
+        'Stage 3 – Baseband LPF – Contains Image Interference', [0.9 0 0]);
+    sgtitle(sprintf('CASE B – WITHOUT RF BPF | Station %d (%.1f kHz): Spectrum', ...
+                    station_idx, target_Fc/1e3), 'FontSize',13,'FontWeight','bold');
+
+    fprintf('  Playing audio – Case B, Station %d (WITHOUT RF BPF)...\n', station_idx);
+    audio_out = decimate(bb_out_B, UPSAMPLE_FACTOR, 'fir');
+    audio_out = audio_out / (max(abs(audio_out)) + eps);
+    sound(audio_out, base_sample_rate);
+    pause(numel(audio_out)/base_sample_rate + 0.5);
+end
+
+% =========================================================================
+%  CASE C – OSCILLATOR FREQUENCY OFFSETS – BOTH STATIONS
+% =========================================================================
+fprintf('\n=== CASE C: Oscillator Frequency Offset Analysis – Both Stations ===\n');
+
+offset_values = [0.1e3, 1e3];
+offset_labels = {'0.1 kHz Offset', '1 kHz Offset'};
+offset_colors = {[0 0.45 0.8], [0.8 0.3 0]};
+bb_outs_C     = cell(num_stations, numel(offset_values));
+
+for station_idx = 1 : num_stations
+    target_Fc = carrier_freq_list(station_idx);
+    F_osc     = target_Fc + IF_FREQ;
+
+    for oi = 1 : numel(offset_values)
+        delta_f     = offset_values(oi);
+        F_osc_off   = F_osc + delta_f;
+        osc_off     = cos(2*pi*F_osc_off*t);
+        clr         = offset_colors{oi};
+
+        fprintf('\n  Station %d | Carrier = %.1f kHz | Offset = %.1f kHz | LO = %.2f kHz\n', ...
+                station_idx, target_Fc/1e3, delta_f/1e3, F_osc_off/1e3);
+
+        rf_out_C  = apply_BPF(fdm_signal, target_Fc, rf_bandwidth, Fs, FILTER_ORDER);
+        mix_out_C = rf_out_C .* osc_off;
+        if_out_C  = apply_BPF(mix_out_C, IF_FREQ, rf_bandwidth, Fs, FILTER_ORDER);
+        bb_mix_C  = if_out_C .* if_carrier;
+        bb_out_C  = apply_LPF(bb_mix_C, message_bandwidth, Fs, FILTER_ORDER);
+        bb_out_C  = bb_out_C / (max(abs(bb_out_C)) + eps);
+        bb_outs_C{station_idx, oi} = bb_out_C;
+
+        % Time domain figure
+        figure('Name', sprintf('Fig C-S%d-O%d-T – Station %d %s: Time Domain', ...
+               station_idx, oi, station_idx, offset_labels{oi}), ...
+               'NumberTitle','off','Color','w');
+        subplot(5,1,1); plot_time(fdm_signal, t, PLOT_DURATION_MS, ...
+            'Stage 0 – Transmitted FDM Signal', [0.8 0.2 0]);
+        subplot(5,1,2); plot_time(rf_out_C, t, PLOT_DURATION_MS, ...
+            sprintf('Stage 1 – RF BPF (centred %.1f kHz)', target_Fc/1e3), [0 0.6 0]);
+        subplot(5,1,3); plot_time(mix_out_C, t, PLOT_DURATION_MS, ...
+            sprintf('Stage 2 – After Mixer (LO offset = +%.1f kHz)', delta_f/1e3), clr);
+        subplot(5,1,4); plot_time(if_out_C, t, PLOT_DURATION_MS, ...
+            'Stage 3 – IF BPF Output', [0.9 0.5 0]);
+        subplot(5,1,5); plot_time(bb_out_C, t, PLOT_DURATION_MS, ...
+            sprintf('Stage 4 – Baseband LPF (Offset = %.1f kHz)', delta_f/1e3), clr);
+        sgtitle(sprintf('CASE C – Station %d (%.1f kHz) | %s: Time Domain', ...
+                        station_idx, target_Fc/1e3, offset_labels{oi}), ...
+                'FontSize',13,'FontWeight','bold');
+
+        % Spectrum figure
+        figure('Name', sprintf('Fig C-S%d-O%d-S – Station %d %s: Spectrum', ...
+               station_idx, oi, station_idx, offset_labels{oi}), ...
+               'NumberTitle','off','Color','w');
+        subplot(5,1,1); plot_spectrum(fdm_signal, Fs, 'Stage 0 – FDM Spectrum', [0.8 0.2 0]);
+        subplot(5,1,2); plot_spectrum(rf_out_C, Fs, ...
+            sprintf('Stage 1 – RF BPF (centred %.1f kHz)', target_Fc/1e3), [0 0.6 0]);
+        subplot(5,1,3); plot_spectrum(mix_out_C, Fs, ...
+            sprintf('Stage 2 – Mixer Output (LO offset +%.1f kHz)', delta_f/1e3), clr);
+        subplot(5,1,4); plot_spectrum(if_out_C, Fs, 'Stage 3 – IF BPF Output', [0.9 0.5 0]);
+        subplot(5,1,5); plot_spectrum(bb_out_C, Fs, ...
+            sprintf('Stage 4 – Baseband LPF (spectral shift = %.1f kHz)', delta_f/1e3), clr);
+        sgtitle(sprintf('CASE C – Station %d (%.1f kHz) | %s: Spectrum', ...
+                        station_idx, target_Fc/1e3, offset_labels{oi}), ...
+                'FontSize',13,'FontWeight','bold');
+
+        fprintf('  Playing audio – Case C, Station %d, %s...\n', station_idx, offset_labels{oi});
+        audio_out = decimate(bb_out_C, UPSAMPLE_FACTOR, 'fir');
+        audio_out = audio_out / (max(abs(audio_out)) + eps);
+        sound(audio_out, base_sample_rate);
+        pause(numel(audio_out)/base_sample_rate + 0.5);
+    end
+end
+
+% =========================================================================
+%  SUMMARY – Final output comparison, all cases, all stations
+% =========================================================================
+case_colors = {[0 0.6 0], [0.9 0 0], [0 0.45 0.8], [0.8 0.3 0]};
+
+for station_idx = 1 : num_stations
+    target_Fc = carrier_freq_list(station_idx);
+
+    figure('Name', sprintf('Fig Sum-S%d-T – Station %d: Time Domain Summary', ...
+           station_idx, station_idx), 'NumberTitle','off','Color','w');
+    subplot(4,1,1); plot_time(bb_outs_A{station_idx}, t, PLOT_DURATION_MS, ...
+        'Case A – WITH RF BPF (clean)', case_colors{1});
+    subplot(4,1,2); plot_time(bb_outs_B{station_idx}, t, PLOT_DURATION_MS, ...
+        'Case B – WITHOUT RF BPF (image interference)', case_colors{2});
+    subplot(4,1,3); plot_time(bb_outs_C{station_idx,1}, t, PLOT_DURATION_MS, ...
+        'Case C1 – LO +0.1 kHz offset', case_colors{3});
+    subplot(4,1,4); plot_time(bb_outs_C{station_idx,2}, t, PLOT_DURATION_MS, ...
+        'Case C2 – LO +1 kHz offset', case_colors{4});
+    sgtitle(sprintf('Station %d (%.1f kHz) – All Cases: Time Domain Comparison', ...
+                    station_idx, target_Fc/1e3), 'FontSize',13,'FontWeight','bold');
+
+    figure('Name', sprintf('Fig Sum-S%d-S – Station %d: Spectrum Summary', ...
+           station_idx, station_idx), 'NumberTitle','off','Color','w');
+    subplot(4,1,1); plot_spectrum(bb_outs_A{station_idx}, Fs, ...
+        'Case A – WITH RF BPF (clean)', case_colors{1});
+    subplot(4,1,2); plot_spectrum(bb_outs_B{station_idx}, Fs, ...
+        'Case B – WITHOUT RF BPF (image interference)', case_colors{2});
+    subplot(4,1,3); plot_spectrum(bb_outs_C{station_idx,1}, Fs, ...
+        'Case C1 – LO +0.1 kHz (slight spectral shift)', case_colors{3});
+    subplot(4,1,4); plot_spectrum(bb_outs_C{station_idx,2}, Fs, ...
+        'Case C2 – LO +1 kHz (noticeable spectral shift)', case_colors{4});
+    sgtitle(sprintf('Station %d (%.1f kHz) – All Cases: Spectrum Comparison', ...
+                    station_idx, target_Fc/1e3), 'FontSize',13,'FontWeight','bold');
+end
+
+fprintf('\n=== Simulation Complete – All Figures Generated ===\n');
+
+% =========================================================================
+%  HELPER FUNCTIONS
+% =========================================================================
+
+function plot_time(signal, t, duration_ms, title_str, color)
+    n_show = find(t >= duration_ms*1e-3, 1, 'first');
+    if isempty(n_show); n_show = numel(t); end
+    plot(t(1:n_show)*1e3, signal(1:n_show), 'Color', color, 'LineWidth', 1.2);
+    title(title_str, 'FontSize', 10, 'FontWeight', 'bold');
+    xlabel('Time (ms)', 'FontSize', 9);
+    ylabel('Amplitude',  'FontSize', 9);
+    xlim([0, t(n_show)*1e3]);
+    grid on;
+end
+
+function plot_spectrum(signal, Fs, title_str, color)
+    N = numel(signal);
+    f = (-N/2 : N/2-1) * (Fs/N);
+    S = abs(fftshift(fft(signal))) / N;
+    plot(f/1e3, S, 'Color', color, 'LineWidth', 1.2);
+    title(title_str, 'FontSize', 10, 'FontWeight', 'bold');
+    xlabel('Frequency (kHz)', 'FontSize', 9);
+    ylabel('|X(f)|',          'FontSize', 9);
+    xlim([-Fs/2/1e3, Fs/2/1e3]);
+    grid on;
+end
+
+function y = apply_BPF(x, Fc, BW, Fs, order)
+    Wn    = [(Fc - BW/2), (Fc + BW/2)] / (Fs/2);
+    Wn    = max(min(Wn, 1-1e-4), 1e-4);
+    [b,a] = butter(order, Wn, 'bandpass');
+    y     = filtfilt(b, a, x);
+end
+
+function y = apply_LPF(x, Fc, Fs, order)
+    Wn    = min(Fc/(Fs/2), 1-1e-4);
+    [b,a] = butter(order, Wn, 'low');
+    y     = filtfilt(b, a, x);
+end
+
+function BW = estimate_bandwidth_99pct(signal, Fs)
+    N  = numel(signal);
+    P  = abs(fft(signal)).^2;
+    P  = P(1:floor(N/2));
+    cP = cumsum(P);
+    idx = find(cP >= 0.99*sum(P), 1, 'first');
+    BW  = idx * (Fs/N) * 1.15;
+end
