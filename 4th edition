@@ -1,0 +1,240 @@
+clear; close all; clc;
+
+%% Parameters
+Fc1 = 100e3;
+Fcs = 30e3;
+Fif = 15e3;
+L   = 10;
+ord = 6;
+dur = 5;
+
+%% Load signals
+files = {'signal1.wav','signal2.wav'};
+ns    = numel(files);
+sigs  = cell(ns,1);
+Fs0   = zeros(ns,1);
+
+for i = 1:ns
+    if isfile(files{i})
+        [x, Fs0(i)] = audioread(files{i});
+        x = mean(x,2);
+    else
+        Fs0(i) = 8000;
+        tv = (0:1/Fs0(i):2-1/Fs0(i))';
+        x  = 0.6*sin(2*pi*(400+(i-1)*1800)*tv) + 0.4*sin(2*pi*(1200+(i-1)*1800)*tv);
+    end
+    sigs{i} = x / max(abs(x));
+end
+
+Nmax = max(cellfun(@numel,sigs));
+for i = 1:ns
+    sigs{i}(end+1:Nmax) = 0;
+end
+
+%% Upsample (Reverted to your original interp for compatibility)
+Fs = Fs0(1)*L;
+for i = 1:ns
+    sigs{i} = interp(sigs{i},L);
+end
+N  = numel(sigs{1});
+t  = (0:N-1)'/Fs;
+
+%% Bandwidth
+Fc  = Fc1 + (0:ns-1)'*Fcs;
+Mbw = zeros(ns,1);
+fprintf('Station | MsgBW(kHz) | RFBW(kHz) | Carrier(kHz)\n');
+for i = 1:ns
+    Mbw(i) = bwest(sigs{i},Fs);
+    fprintf('  %d     |  %.3f    |  %.3f   |  %.1f\n',i,Mbw(i)/1e3,2*Mbw(i)/1e3,Fc(i)/1e3);
+end
+
+% FIX: Add a safe +2kHz absolute headroom instead of a multiplier 
+% so we don't accidentally push the filter bounds past Nyquist.
+Bw = Mbw(1) + 2e3; 
+RFbw = 2*Bw; 
+
+%% Modulate + FDM
+fdm = zeros(N,1);
+for i = 1:ns
+    fdm = fdm + sigs{i}.*cos(2*pi*Fc(i)*t);
+end
+ifc = cos(2*pi*Fif*t);
+
+%% Figures: baseband spectra
+figure;
+for i = 1:ns
+    subplot(ns,1,i); pspec(sigs{i},Fs,sprintf('Station %d Baseband | BW=%.2fkHz',i,Mbw(i)/1e3),'b');
+end
+
+%% Case A – with RF BPF
+bbA = cell(ns,1);
+for i = 1:ns
+    lo = cos(2*pi*(Fc(i)+Fif)*t);
+    r  = bpf(fdm,Fc(i),RFbw,Fs,ord);
+    m  = r.*lo;
+    f  = bpf(m,Fif,RFbw,Fs,ord);
+    b  = lpf(f.*ifc,Bw,Fs,ord);
+    
+    % FIX: Exact mathematical gain restoration. 2 mixers = 1/4 amplitude.
+    b  = b * 4; 
+    bbA{i} = b;
+
+    figure;
+    subplot(5,1,1); ptim(fdm,t,dur,'FDM input',[.8 .2 0]);
+    subplot(5,1,2); ptim(r,t,dur,sprintf('RF BPF @ %.0fkHz',Fc(i)/1e3),[0 .6 0]);
+    subplot(5,1,3); ptim(m,t,dur,'After Mixer',[.6 0 .6]);
+    subplot(5,1,4); ptim(f,t,dur,sprintf('IF BPF @ %.0fkHz',Fif/1e3),[.9 .5 0]);
+    subplot(5,1,5); ptim(b,t,dur,'Recovered',[0 .3 .9]);
+    sgtitle(sprintf('Case A – Station %d Time',i));
+
+    figure;
+    subplot(5,1,1); pspec(fdm,Fs,'FDM',[.8 .2 0]);
+    subplot(5,1,2); pspec(r,Fs,sprintf('RF BPF @ %.0fkHz',Fc(i)/1e3),[0 .6 0]);
+    subplot(5,1,3); pspec(m,Fs,'Mixer out',[.6 0 .6]);
+    subplot(5,1,4); pspec(f,Fs,sprintf('IF BPF @ %.0fkHz',Fif/1e3),[.9 .5 0]);
+    subplot(5,1,5); pspec(b,Fs,'Recovered',[0 .3 .9]);
+    sgtitle(sprintf('Case A – Station %d Spectrum',i));
+
+    % FIX: Reverted to decimate but strictly bounded for audiowrite
+    au = decimate(b,L,'fir'); 
+    au = max(min(au, 1), -1); % Prevents clipping errors
+    
+    audiowrite(sprintf('CaseA_Station%d.wav',i), au, Fs0(1));
+    sound(au, Fs0(1)); pause(numel(au)/Fs0(1)+0.5);
+end
+
+%% Case B – no RF BPF
+bbB = cell(ns,1);
+for i = 1:ns
+    lo = cos(2*pi*(Fc(i)+Fif)*t);
+    m  = fdm.*lo;
+    f  = bpf(m,Fif,RFbw,Fs,ord);
+    b  = lpf(f.*ifc,Bw,Fs,ord);
+    
+    b  = b * 4; 
+    bbB{i} = b;
+
+    figure;
+    subplot(4,1,1); ptim(fdm,t,dur,'FDM (no RF filter)',[.8 .2 0]);
+    subplot(4,1,2); ptim(m,t,dur,'After Mixer (image present)',[.6 0 .6]);
+    subplot(4,1,3); ptim(f,t,dur,'IF BPF out',[.9 .5 0]);
+    subplot(4,1,4); ptim(b,t,dur,'Recovered (distorted)',[.9 0 0]);
+    sgtitle(sprintf('Case B – Station %d Time',i));
+
+    figure;
+    subplot(4,1,1); pspec(fdm,Fs,'FDM',[.8 .2 0]);
+    subplot(4,1,2); pspec(m,Fs,'Mixer out',[.6 0 .6]);
+    subplot(4,1,3); pspec(f,Fs,'IF BPF out',[.9 .5 0]);
+    subplot(4,1,4); pspec(b,Fs,'Recovered (image interference)',[.9 0 0]);
+    sgtitle(sprintf('Case B – Station %d Spectrum',i));
+
+    au = decimate(b,L,'fir'); 
+    au = max(min(au, 1), -1);
+    
+    audiowrite(sprintf('CaseB_Station%d.wav',i), au, Fs0(1));
+    sound(au, Fs0(1)); pause(numel(au)/Fs0(1)+0.5);
+end
+
+%% Case C – LO offset
+offs   = [0.1e3, 1e3];
+bbC    = cell(ns,2);
+colors = {[0 .45 .8],[.8 .3 0]};
+for i = 1:ns
+    for k = 1:2
+        lo = cos(2*pi*(Fc(i)+Fif+offs(k))*t);
+        r  = bpf(fdm,Fc(i),RFbw,Fs,ord);
+        m  = r.*lo;
+        f  = bpf(m,Fif,RFbw,Fs,ord);
+        b  = lpf(f.*ifc,Bw,Fs,ord);
+        
+        b  = b * 4; 
+        bbC{i,k} = b;
+        clr = colors{k};
+
+        figure;
+        subplot(5,1,1); ptim(fdm,t,dur,'FDM',[.8 .2 0]);
+        subplot(5,1,2); ptim(r,t,dur,sprintf('RF BPF @ %.0fkHz',Fc(i)/1e3),[0 .6 0]);
+        subplot(5,1,3); ptim(m,t,dur,sprintf('Mixer (LO+%.1fkHz)',offs(k)/1e3),clr);
+        subplot(5,1,4); ptim(f,t,dur,'IF BPF',[.9 .5 0]);
+        subplot(5,1,5); ptim(b,t,dur,sprintf('Recovered offset=%.1fkHz',offs(k)/1e3),clr);
+        sgtitle(sprintf('Case C – Station %d offset %.1fkHz Time',i,offs(k)/1e3));
+
+        figure;
+        subplot(5,1,1); pspec(fdm,Fs,'FDM',[.8 .2 0]);
+        subplot(5,1,2); pspec(r,Fs,sprintf('RF BPF @ %.0fkHz',Fc(i)/1e3),[0 .6 0]);
+        subplot(5,1,3); pspec(m,Fs,sprintf('Mixer out offset+%.1fkHz',offs(k)/1e3),clr);
+        subplot(5,1,4); pspec(f,Fs,'IF BPF',[.9 .5 0]);
+        subplot(5,1,5); pspec(b,Fs,sprintf('Recovered shift=%.1fkHz',offs(k)/1e3),clr);
+        sgtitle(sprintf('Case C – Station %d offset %.1fkHz Spectrum',i,offs(k)/1e3));
+
+        au = decimate(b,L,'fir'); 
+        au = max(min(au, 1), -1);
+        
+        audiowrite(sprintf('CaseC_Station%d_offset%.0fHz.wav',i,offs(k)), au, Fs0(1));
+        sound(au, Fs0(1)); pause(numel(au)/Fs0(1)+0.5);
+    end
+end
+
+%% Summary
+cc = {[0 .6 0],[.9 0 0],[0 .45 .8],[.8 .3 0]};
+for i = 1:ns
+    figure;
+    subplot(4,1,1); ptim(bbA{i},t,dur,'Case A – clean',cc{1});
+    subplot(4,1,2); ptim(bbB{i},t,dur,'Case B – image interference',cc{2});
+    subplot(4,1,3); ptim(bbC{i,1},t,dur,'Case C – 0.1kHz offset',cc{3});
+    subplot(4,1,4); ptim(bbC{i,2},t,dur,'Case C – 1kHz offset',cc{4});
+    sgtitle(sprintf('Station %d – All Cases Time',i));
+
+    figure;
+    subplot(4,1,1); pspec(bbA{i},Fs,'Case A – clean',cc{1});
+    subplot(4,1,2); pspec(bbB{i},Fs,'Case B – image interference',cc{2});
+    subplot(4,1,3); pspec(bbC{i,1},Fs,'Case C – 0.1kHz offset',cc{3});
+    subplot(4,1,4); pspec(bbC{i,2},Fs,'Case C – 1kHz offset',cc{4});
+    sgtitle(sprintf('Station %d – All Cases Spectrum',i));
+end
+
+fprintf('\nDone. Audio files saved:\n');
+for i = 1:ns
+    fprintf('  CaseA_Station%d.wav\n',i);
+    fprintf('  CaseB_Station%d.wav\n',i);
+    for k = 1:2
+        fprintf('  CaseC_Station%d_offset%.0fHz.wav\n',i,offs(k));
+    end
+end
+
+%% Helper functions
+function ptim(x,t,ms,ttl,c)
+    n = find(t>=ms*1e-3,1); if isempty(n), n=numel(t); end
+    plot(t(1:n)*1e3,x(1:n),'Color',c,'LineWidth',1.2);
+    title(ttl,'FontSize',9); xlabel('Time(ms)'); ylabel('Amp'); xlim([0 t(n)*1e3]); grid on;
+end
+
+function pspec(x,Fs,ttl,c)
+    N=numel(x); f=(-N/2:N/2-1)*(Fs/N);
+    plot(f/1e3,abs(fftshift(fft(x)))/N,'Color',c,'LineWidth',1.2);
+    title(ttl,'FontSize',9); xlabel('Freq(kHz)'); ylabel('|X(f)|');
+    xlim([-Fs/2/1e3 Fs/2/1e3]); grid on;
+end
+
+function y = bpf(x,Fc,BW,Fs,ord)
+    % FIX: Added strict bounding to prevent butter() crashing from bad dimensions
+    Wn = [(Fc-BW/2) (Fc+BW/2)] / (Fs/2);
+    Wn(1) = max(Wn(1), 1e-4);
+    Wn(2) = min(Wn(2), 1-1e-4);
+    if Wn(1) >= Wn(2)
+        Wn(1) = Wn(2) - 1e-4; % Failsafe
+    end
+    [b,a] = butter(ord,Wn,'bandpass'); y = filtfilt(b,a,x);
+end
+
+function y = lpf(x,Fc,Fs,ord)
+    % FIX: Safe bounds applied
+    Wn = min(Fc/(Fs/2), 1-1e-4);
+    [b,a] = butter(ord,Wn,'low'); y = filtfilt(b,a,x);
+end
+
+function BW = bwest(x,Fs)
+    N=numel(x); P=abs(fft(x)).^2; P=P(1:floor(N/2));
+    BW = find(cumsum(P)>=0.99*sum(P),1)*(Fs/N)*1.15;
+    if isempty(BW), BW = Fs/4; end % Failsafe
+end
